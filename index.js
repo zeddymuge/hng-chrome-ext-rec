@@ -68,6 +68,8 @@ async function getTranscriptionResult(jobName) {
 io.on('connection', (socket) => {
   console.log('Client connected');
 
+  const videoChunks = [];
+
   socket.on('start-streaming', (videoFilename) => {
     console.log('Start streaming:', videoFilename);
 
@@ -80,9 +82,11 @@ io.on('connection', (socket) => {
 
     activeStreams[socket.id] = stream;
 
-    // Emit the video stream to the client
     stream.on('data', (chunk) => {
-      socket.emit('stream', chunk);
+      // Buffer the chunks
+      videoChunks.push(chunk);
+      // Emit the concatenated stream to the client
+      socket.emit('stream', Buffer.concat(videoChunks));
     });
 
     stream.on('end', async () => {
@@ -167,7 +171,7 @@ async function processAndTranscribeVideo(videoBuffer, videoFilename) {
   const transcriptionParams = {
     TranscriptionJobName: jobName,
     LanguageCode: 'en-US', 
-    MediaSampleRateHertz: 44100, 
+    MediaSampleRateHertz: 44100,
     MediaFormat: 'webm', 
     Media: { MediaFileUri: videoBuffer.toString('base64') } 
   };
@@ -191,6 +195,60 @@ async function processAndTranscribeVideo(videoBuffer, videoFilename) {
   } catch (error) {
     console.error('Error transcribing video:', error);
     throw error;
+  }
+}
+
+// Route to get a list of videos
+app.get('/api/videos', async (req, res) => {
+  try {
+    const s3 = new AWS.S3();
+    const listObjectsV2 = s3.listObjectsV2.bind(s3);
+
+    const data = await listObjectsV2({ Bucket: S3_BUCKET }).promise();
+
+    if (data.Contents.length === 0) {
+      return res.json({ message: 'No videos found' });
+    }
+
+    const videos = data.Contents.map((obj) => ({
+      key: obj.Key,
+      url: `https://${S3_BUCKET}.s3.amazonaws.com/${obj.Key}`,
+    }));
+
+    res.json(videos);
+  } catch (error) {
+    console.error('Error listing videos:', error);
+    res.status(500).json({ error: 'Error listing videos' });
+  }
+});
+
+// Route to play a specific video
+app.get('/api/play/:videoKey', (req, res) => {
+  const videoKey = req.params.videoKey;
+  const stream = s3.getObject({ Bucket: S3_BUCKET, Key: videoKey }).createReadStream();
+
+  // Set the Content-Type header based on the video file extension
+  const contentType = getContentType(videoKey);
+  res.setHeader('Content-Type', contentType);
+
+  stream.pipe(res);
+
+  stream.on('error', (error) => {
+    console.error('Error streaming video:', error);
+    res.status(500).json({ error: 'Error streaming video' });
+  });
+});
+
+// Helper function to get the Content-Type based on file extension
+function getContentType(key) {
+  const ext = key.split('.').pop().toLowerCase();
+  switch (ext) {
+    case 'mp4':
+      return 'video/mp4';
+    case 'webm':
+      return 'video/webm';
+    default:
+      return 'application/octet-stream';
   }
 }
 

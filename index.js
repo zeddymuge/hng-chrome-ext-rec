@@ -1,66 +1,130 @@
-require('dotenv').config();
-
 const express = require('express');
-const AWS = require('aws-sdk');
+const http = require('http');
 const multer = require('multer');
-const multerS3 = require('multer-s3');
-const { promisify } = require('util');
-const cors = require('cors');
-
+const AWS = require('aws-sdk');
+const socketIo = require('socket.io');
+const { PassThrough } = require('stream');
 
 const app = express();
-app.use(cors());
+const server = http.createServer(app);
+const io = socketIo(server);
 
-// Configure AWS S3
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const S3_BUCKET = process.env.S3_BUCKET;
 const S3_REGION = process.env.S3_REGION;
 
-// Initialize AWS S3 client
 AWS.config.update({
   accessKeyId: AWS_ACCESS_KEY_ID,
   secretAccessKey: AWS_SECRET_ACCESS_KEY,
   region: S3_REGION,
 });
 
-// Configure multer for S3 upload
-const upload = multer({
-  storage: multerS3({
-    s3: new AWS.S3(),
-    bucket: S3_BUCKET,
-    acl: 'public-read',
-    key: function (req, file, cb) {
-      cb(null, Date.now().toString() + '-' + file.originalname);
-    },
-  }),
-}).single('video');
+const s3 = new AWS.S3();
+const upload = multer();
 
-// Initialize AWS Transcribe
-const transcribeService = new AWS.TranscribeService();
+let activeStreams = {};
 
-async function transcribeVideo(jobName, mediaFileUri) {
-  try {
-    const params = {
-      TranscriptionJobName: jobName,
-      Media: {
-        MediaFileUri: mediaFileUri,
-      },
-      OutputBucketName: S3_BUCKET,
-    };
+// Function to wait for the transcription job to complete
+async function waitForTranscriptionJobCompletion(jobName) {
+  const transcribeService = new AWS.TranscribeService();
 
-    const transcriptionJob = await transcribeService.startTranscriptionJob(params).promise();
+  while (true) {
+    const { TranscriptionJob } = await transcribeService.getTranscriptionJob({ TranscriptionJobName: jobName }).promise();
 
-    console.log('Transcription job started:', transcriptionJob);
+    if (TranscriptionJob.TranscriptionJobStatus === 'COMPLETED') {
+      return;
+    } else if (TranscriptionJob.TranscriptionJobStatus === 'FAILED' || TranscriptionJob.TranscriptionJobStatus === 'CANCELLED') {
+      throw new Error(`Transcription job failed or was cancelled: ${jobName}`);
+    }
 
-    return transcriptionJob;
-  } catch (error) {
-    console.error('Error starting transcription job:', error);
-    throw error;
+    // Wait for a few seconds before checking the status again
+    await new Promise(resolve => setTimeout(resolve, 5000));
   }
 }
 
-app.post('/api/upload', upload, (req, res) => {
+// Function to get the transcription result
+async function getTranscriptionResult(jobName) {
+  const transcribeService = new AWS.TranscribeService();
+
+  const { TranscriptionJob } = await transcribeService.getTranscriptionJob({ TranscriptionJobName: jobName }).promise();
+
+  if (TranscriptionJob.Transcript && TranscriptionJob.Transcript.TranscriptFileUri) {
+    // Download the transcription result file
+    const transcriptFile = await transcribeService
+      .getTranscriptionJob(TranscriptionJob.Transcript.TranscriptFileUri)
+      .promise();
+
+    // Parse the result (you may need to adjust this based on the actual format)
+    return JSON.parse(transcriptFile.Body.toString());
+  }
+
+  return null;
+}
+
+io.on('connection', (socket) => {
+  console.log('Client connected');
+
+  socket.on('start-streaming', (videoFilename) => {
+    console.log('Start streaming:', videoFilename);
+
+    const params = {
+      Bucket: S3_BUCKET,
+      Key: videoFilename,
+    };
+
+    const stream = s3.getObject(params).createReadStream();
+
+    activeStreams[socket.id] = stream;
+
+    // Emit the video stream to the client
+    stream.on('data', (chunk) => {
+      socket.emit('stream', chunk);
+    });
+
+    stream.on('end', async () => {
+      console.log('End of stream');
+      const passThrough = new PassThrough();
+      passThrough.end(); // End the stream to trigger transcription completion
+
+      // Call your function to handle video parts and transcribe
+      await processAndTranscribeVideo(passThrough, videoFilename);
+
+      // Disconnect the client
+      socket.disconnect(true);
+    });
+
+    stream.on('error', (error) => {
+      console.error('Error streaming video:', error);
+      socket.disconnect(true);
+    });
+  });
+
+  socket.on('stop-streaming', () => {
+    console.log('Stop streaming');
+    const stream = activeStreams[socket.id];
+
+    if (stream) {
+      stream.removeAllListeners();
+      delete activeStreams[socket.id];
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected');
+    const stream = activeStreams[socket.id];
+
+    if (stream) {
+      stream.removeAllListeners();
+      delete activeStreams[socket.id];
+    }
+  });
+});
+
+app.post('/api/upload', upload.single('video'), async (req, res) => {
   console.log('Inside upload endpoint');
 
   if (!req.file) {
@@ -70,104 +134,68 @@ app.post('/api/upload', upload, (req, res) => {
 
   const videoFilename = req.file.originalname;
 
-  console.log('File uploaded successfully');
-  return res.status(202).json({
-    video_name: videoFilename,
-  });
-});
-
-app.get('/api/video-info/:video_filename', (req, res) => {
-  const videoFilename = req.params.video_filename;
-
-  console.log('Video information retrieved successfully');
-  return res.status(200).json({
-    video_name: videoFilename,
-  });
-});
-
-app.get('/api/transcribe/:video_filename', async (req, res) => {
-  const videoFilename = req.params.video_filename;
-
+  // Process and upload the video chunks to S3
   try {
-    const jobName = `TranscriptionJob_${Date.now()}`;
-    const mediaFileUri = `s3://${S3_BUCKET}/${videoFilename}`;
+    const params = {
+      Bucket: S3_BUCKET,
+      Key: videoFilename,
+      Body: req.file.buffer,
+    };
 
-    // Start transcription job
-    const transcriptionJob = await transcribeVideo(jobName, mediaFileUri);
+    await s3.upload(params).promise();
 
-    return res.status(200).json({
-      job_name: transcriptionJob.TranscriptionJobName,
-      status: transcriptionJob.TranscriptionJobStatus,
-    });
+    console.log('File uploaded successfully');
+
+    // Call your function to handle video parts and transcribe
+    await processAndTranscribeVideo(req.file.buffer, videoFilename);
+
+    res.status(201).json({ message: 'successfully uploaded video' });
+
   } catch (error) {
-    console.error('Error transcribing video:', error);
-    return res.status(500).json({ error: 'Error transcribing video' });
+    console.error('Error uploading video chunk:', error);
+    return res.status(500).json({ error: 'Error uploading video chunk' });
   }
 });
 
-function getContentType(key) {
-  const ext = key.split('.').pop().toLowerCase();
-  switch (ext) {
-    case 'mp4':
-      return 'video/mp4';
-    case 'webm':
-      return 'video/webm';
-    default:
-      return 'application/octet-stream';
-  }
-}
-app.get('/api/videos', async (req, res) => {
-  try {
-    const s3 = new AWS.S3();
-    const listObjectsV2 = promisify(s3.listObjectsV2.bind(s3));
+async function processAndTranscribeVideo(videoBuffer, videoFilename) {
+  const transcribeService = new AWS.TranscribeService();
 
-    const data = await listObjectsV2({ Bucket: process.env.S3_BUCKET });
+  // Create a unique job name
+  const jobName = `TranscriptionJob_${Date.now()}`;
 
-    if (data.Contents.length === 0) {
-      return res.json({ message: 'No videos found' });
-    }
-
-    const videos = data.Contents.map((obj) => ({
-      key: obj.Key,
-      url: `https://${process.env.S3_BUCKET}.s3.amazonaws.com/${obj.Key}`,
-    }));
-
-    res.json(videos);
-  } catch (error) {
-    console.error('Error listing videos:', error);
-    res.status(500).json({ error: 'Error listing videos' });
-  }
-});
-
-// Play a specific video
-app.get('/api/play/:videoKey', (req, res) => {
-  const videoKey = req.params.videoKey;
-  const s3 = new AWS.S3();
-
-  console.log('Fetching video with key:', videoKey);
-
-  const params = {
-    Bucket: process.env.S3_BUCKET,
-    Key: videoKey,
+  // Define the AWS Transcribe parameters
+  const transcriptionParams = {
+    TranscriptionJobName: jobName,
+    LanguageCode: 'en-US', 
+    MediaSampleRateHertz: 44100, 
+    MediaFormat: 'webm', 
+    Media: { MediaFileUri: videoBuffer.toString('base64') } 
   };
 
-  const stream = s3.getObject(params).createReadStream();
+  try {
+    // Start the transcription job
+    const transcriptionJob = await transcribeService.startTranscriptionJob(transcriptionParams).promise();
 
-  // Set the Content-Type header based on the video file extension
-  const contentType = getContentType(videoKey);
-  res.setHeader('Content-Type', contentType);
+    console.log('Transcription job started:', transcriptionJob);
 
-  stream.pipe(res);
+    // Wait for the transcription job to complete
+    await waitForTranscriptionJobCompletion(transcriptionJob.TranscriptionJobName);
 
-  stream.on('error', (error) => {
-    console.error('Error streaming video:', error);
-    res.status(500).json({ error: 'Error streaming video' });
-  });
-});
+    // Optionally, you can retrieve the transcript from the completed job
+    const transcript = await getTranscriptionResult(transcriptionJob.TranscriptionJobName);
 
+    console.log('Transcription complete:', transcript);
+
+    // Handle the transcript as needed (store in the database, emit to clients, etc.)
+
+  } catch (error) {
+    console.error('Error transcribing video:', error);
+    throw error;
+  }
+}
 
 const PORT = process.env.PORT || 3009;
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
